@@ -52,18 +52,51 @@ def getValueFromKeyPath(map, keyPath) {
 }
 
 
-def setValueForKeyPath(map, keyPath, value) {
+def setValueForKeyPath(map, keyPath, newValue) {
     def keys = keyPath.split('\\.')
     def currentMap = map
+    
     for (int i = 0; i < keys.size() - 1; i++) {
-        if (!currentMap.containsKey(keys[i])) {
-            currentMap.put(keys[i], [:]) // Create a new map if the key does not exist
+        def key = convertKeyToInteger(keys[i])
+        if (!currentMap.containsKey(key)) {
+            currentMap.put(key, [:])
         }
-        currentMap = currentMap[keys[i]]
+        currentMap = currentMap[key]
     }
-    currentMap[keys.last()] = value
+    
+    def lastKey = convertKeyToInteger(keys.last())
+    def oldValue = currentMap[lastKey]
+    
+    if (oldValue instanceof List && newValue instanceof List) {
+        // Kiểm tra có phần tử trùng không
+        def hasCommon = oldValue.any { newValue.contains(it) }
+        
+        if (hasCommon) {
+            echo "WARNING: Key '${keyPath}' has duplicate values. Using MERGE_UNIQUE strategy."
+            // Merge và loại bỏ trùng
+            def mergedList = new ArrayList(oldValue)
+            newValue.each { item ->
+                if (!mergedList.contains(item)) {
+                    mergedList.add(item)
+                }
+            }
+            currentMap[lastKey] = mergedList
+        } else {
+            // Không trùng → merge tất cả
+            def mergedList = new ArrayList(oldValue)
+            mergedList.addAll(newValue)
+            currentMap[lastKey] = mergedList
+        }
+    } else if (oldValue instanceof List && !(newValue instanceof List)) {
+        def mergedList = new ArrayList(oldValue)
+        if (!mergedList.contains(newValue)) {
+            mergedList.add(newValue)
+        }
+        currentMap[lastKey] = mergedList
+    } else {
+        currentMap[lastKey] = newValue
+    }
 }
-
 
 def levenshteinDistance(String s1, String s2) {
     if (s2.length() == 0) return s1.length()
@@ -235,7 +268,7 @@ node("built-in") {
                                     name: 'MODULES', 
                                     trim: true
                                     )
-                                ]                              
+                                ]                             
     }    
     stage("Enter variables") {
             env.UPDATE_VARIABLES = input message: 'Enter variables here !!!', 
@@ -247,7 +280,7 @@ node("built-in") {
                                     name: 'UPDATE_VARIABLES', 
                                     trim: true
                                     )
-                                ]                   
+                                ]                  
     }    
     def configmapsForUpdate = [:]
     def deploymentNeedsRollout = [:]
