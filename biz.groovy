@@ -1,9 +1,282 @@
-
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.DumperOptions
 def BASTIONS = ['']
 def USER = ''
-def NAMESPACES= ['']
+def NAMESPACES= ['', '', '']
+
+// ====== NEW FUNCTIONS FOR MODULE CONFIGURATION PROCESSING ======
+
+
+def findConfigmapInNamespace(String user, String bastion, String namespace, 
+                             String searchTerm, String moduleName) {
+    /**
+     * Tìm ConfigMap tương ứng với searchTerm trong namespace
+     * Sử dụng getBestMatch để fuzzy search
+     */
+    def configmaps = sh(
+        script: """
+            ssh ${user}@${bastion} kubectl get configmap -n ${namespace} | awk 'NR > 1 {print \$1}'
+        """,
+        returnStdout: true
+    ).trim()
+    
+    if (!configmaps) {
+        echo "No configmaps found in namespace ${namespace}"
+        return null
+    }
+    
+    def bestCandidate = getBestMatch(searchTerm, configmaps.split("\n"))
+    return bestCandidate
+}
+
+// ====== END NEW FUNCTIONS ======
+
+def parseModuleConfigWithVariables(String yamlString) {
+    /**
+     * Parse cấu trúc mới:
+     * authentication:
+     *   dev:
+     *     variables: {...}
+     *   staging:
+     *     variables: {...}
+     *   all:
+     *     variables: {...}
+     */
+    def yaml = new Yaml().load(yamlString)
+    return yaml ?: [:]
+}
+
+def expandConfigmapNamespaces(def namespaceValue, List<String> definedNamespaces) {
+    /**
+     * Xử lý namespace value có thể là:
+     * - String "dev" hoặc "All"
+     * - List ["dev", "staging"]
+     */
+    def result = []
+    
+    if (namespaceValue instanceof String) {
+        if (namespaceValue.trim().equalsIgnoreCase("All")) {
+            result = definedNamespaces
+        } else {
+            if (definedNamespaces.contains(namespaceValue.trim())) {
+                result = [namespaceValue.trim()]
+            }
+        }
+    } else if (namespaceValue instanceof List) {
+        namespaceValue.each { ns ->
+            def trimmed = ns.toString().trim()
+            if (trimmed.equalsIgnoreCase("All")) {
+                result.addAll(definedNamespaces)
+            } else if (definedNamespaces.contains(trimmed)) {
+                result.add(trimmed)
+            }
+        }
+        result = result.unique() // Loại bỏ duplicate
+    }
+    
+    return result
+}
+
+def processModuleConfigurations(Map moduleConfigs, List<String> definedNamespaces, 
+                                List<String> bastions) {
+    /**
+     * Tạo task list:
+     * - Lặp qua từng module
+     * - Lặp qua từng namespace config (dev, staging, all, etc)
+     * - Nếu là "all" → apply cho tất cả namespaces trong definedNamespaces
+     * - Nếu là namespace cụ thể → apply chỉ cho namespace đó
+     * - Merge variables nếu vừa có "all" vừa có namespace cụ thể
+     */
+    def taskList = []
+    
+    moduleConfigs.each { moduleName, namespaceConfigs ->
+        if (!(namespaceConfigs instanceof Map)) {
+            echo "⚠️ WARNING: Module '${moduleName}' config is not a map, skipping"
+            return
+        }
+        
+        // Lấy variables từ "all" nếu có (default)
+        def allVariables = [:]
+        if (namespaceConfigs.containsKey('all')) {
+            def allConfig = namespaceConfigs.all
+            if (allConfig instanceof Map && allConfig.containsKey('variables')) {
+                allVariables = allConfig.variables ?: [:]
+            }
+        }
+        
+        // Xử lý từng namespace
+        namespaceConfigs.each { nsKey, nsConfig ->
+            // Bỏ qua key "all" vì đã xử lý rồi
+            if (nsKey == 'all') {
+                return
+            }
+            
+            if (!(nsConfig instanceof Map) || !nsConfig.containsKey('variables')) {
+                echo "⚠️ WARNING: Namespace '${nsKey}' under module '${moduleName}' has no variables, skipping"
+                return
+            }
+            
+            def targetNamespaces = []
+            
+            // Kiểm tra xem nsKey là "all" hay namespace cụ thể
+            if (nsKey.toString().equalsIgnoreCase("all")) {
+                targetNamespaces = definedNamespaces
+            } else if (definedNamespaces.contains(nsKey.toString())) {
+                targetNamespaces = [nsKey.toString()]
+            } else {
+                echo "⚠️ WARNING: Namespace '${nsKey}' not found in defined namespaces, skipping"
+                return
+            }
+            
+            // Merge variables: all variables + namespace-specific variables
+            def mergedVariables = deepMergeMap(allVariables, nsConfig.variables ?: [:])
+            
+            targetNamespaces.each { targetNamespace ->
+                bastions.each { bastion ->
+                    taskList.add([
+                        moduleName: moduleName,
+                        namespace: targetNamespace,
+                        bastion: bastion,
+                        variables: mergedVariables,
+                        configSource: nsKey  // Để biết thay đổi từ namespace nào
+                    ])
+                }
+            }
+        }
+        
+        // Xử lý "all" - apply cho tất cả namespaces nếu chỉ có "all" và không có config namespace cụ thể
+        if (namespaceConfigs.containsKey('all')) {
+            def hasSpecificNamespace = namespaceConfigs.keySet().any { 
+                it != 'all' && definedNamespaces.contains(it.toString()) 
+            }
+            
+            if (!hasSpecificNamespace) {
+                definedNamespaces.each { targetNamespace ->
+                    bastions.each { bastion ->
+                        taskList.add([
+                            moduleName: moduleName,
+                            namespace: targetNamespace,
+                            bastion: bastion,
+                            variables: allVariables,
+                            configSource: 'all'
+                        ])
+                    }
+                }
+            }
+        }
+    }
+    
+    return taskList
+}
+
+def deepMergeMap(Map base, Map override) {
+    /**
+     * Merge 2 maps - override values sẽ ghi đè base values
+     * Nếu value là map → recursive merge
+     * Nếu value khác → override lấy giá trị mới
+     */
+    def result = base.clone()
+    
+    override.each { key, value ->
+        if (value instanceof Map && result.containsKey(key) && result[key] instanceof Map) {
+            result[key] = deepMergeMap(result[key], value)
+        } else {
+            result[key] = value
+        }
+    }
+    
+    return result
+}
+
+
+def printChangePreview(Map task) {
+    /**
+     * In preview thay đổi chi tiết cho 1 task
+     */
+    def yamlDump = new Yaml().dumpAs(task.variables, null, DumperOptions.FlowStyle.BLOCK)
+    def indentedYaml = yamlDump.split('\n').collect { line -> "  ${line}" }.join('\n')
+    
+    def preview = """
+┌──────────────────────────────────────────────────────────────────┐
+│ Module:    ${String.format('%-48s', task.moduleName)} │
+│ Namespace: ${String.format('%-48s', task.namespace)} │
+│ Bastion:   ${String.format('%-48s', task.bastion)} │
+│ Source:    ${String.format('%-48s', task.configSource)} │
+├──────────────────────────────────────────────────────────────────┤
+│ VARIABLES:                                                       │
+│                                                                  │
+${indentedYaml.split('\n').collect { "│ " + String.format('%-60s', it) + "│" }.join('\n')}
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+"""
+    
+    return preview
+}
+def printAllChangesPreview(List<Map> taskList) {
+    /**
+     * In preview tất cả thay đổi grouped by Module
+     * Hiển thị tất cả namespaces từ taskList (đã bao gồm tất cả defined namespaces)
+     */
+    echo """
+
+╔════════════════════════════════════════════════════════════════════╗
+║                  📋 CONFIGURATION CHANGES PREVIEW                 ║
+║                  Total: ${String.format('%d', taskList.size())} change(s)                            ║
+╚════════════════════════════════════════════════════════════════════╝
+"""
+    
+    // Group by module
+    def groupedByModule = taskList.groupBy { it.moduleName }
+    
+    groupedByModule.each { moduleName, tasks ->
+        echo """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🔧 MODULE: ${moduleName}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        // Group theo namespace để dễ nhìn
+        def groupedByNamespace = tasks.groupBy { it.namespace }
+        
+        groupedByNamespace.each { namespace, nsTasks ->
+            // Lấy task đầu tiên để hiển thị (vì variables giống nhau, chỉ khác bastion)
+            def firstTask = nsTasks.first()
+            
+            echo """
+  📍 Namespace: ${String.format('%-20s', namespace)} (config source: ${firstTask.configSource})
+     
+"""
+            
+            def yamlDump = new Yaml().dumpAs(firstTask.variables, null, DumperOptions.FlowStyle.BLOCK)
+            def indentedYaml = yamlDump.split('\n').collect { line -> "     ${line}" }.join('\n')
+            
+            echo indentedYaml
+            
+            echo """
+     Applying to bastions: ${nsTasks.collect { it.bastion }.unique().join(', ')}
+     
+"""
+        }
+    }
+    
+    echo """
+╔════════════════════════════════════════════════════════════════════╗
+║              ⚠️  Please review above before proceeding!            ║
+╚════════════════════════════════════════════════════════════════════╝
+"""
+}
+
+
+
+def convertVariablesToUpdateFormat(Map variables) {
+    /**
+     * Chuyển đổi variables YAML thành format mà setValueForKeyPath có thể dùng
+     * Trả về: YAML string để load vào updateConfigmap
+     */
+    def yaml = new Yaml()
+    return yaml.dumpAs(variables, null, DumperOptions.FlowStyle.BLOCK)
+}
+
 def convertKeyToInteger(key) {
     return (key instanceof String && key.isInteger()) ? key.toInteger() : key
 }
@@ -186,7 +459,7 @@ def backupAndDeploy(USER, BASTION){
 
 }
 
-def updateConfigmap(USER, BASTION, selectedConfigmap, selectedNamespace){
+def updateConfigmap(USER, BASTION, selectedConfigmap, selectedNamespace, Map variables = null){
     stage("Backup Configmap - ${BASTION} - ${selectedConfigmap} - ${selectedNamespace}") {
         def yamlOutput = sh(
                     script: """
@@ -224,12 +497,19 @@ def updateConfigmap(USER, BASTION, selectedConfigmap, selectedNamespace){
             def yamlString = String.valueOf(yamlOutput).trim()
             def yaml = new Yaml().load(yamlString)
             def yaml_application = new Yaml().load(yaml.data["application.yml"])
-            def yamlX = new Yaml().load(UPDATE_VARIABLES)
-            def keyList = printLastKeyOfEachBranch(UPDATE_VARIABLES)
-            keyList.each { key ->         
-                setValueForKeyPath(yaml_application, key, getValueFromKeyPath(yamlX,key))
+            
+            // ===== THAY ĐỔI CHÍNH: Sử dụng variables từ task thay vì UPDATE_VARIABLES =====
+            if (variables != null && !variables.isEmpty()) {
+                def yamlX = variables
+                def keyList = printLastKeyOfEachBranch(convertVariablesToUpdateFormat(variables))
+                keyList.each { key ->         
+                    setValueForKeyPath(yaml_application, key, getValueFromKeyPath(yamlX, key))
+                }
+                echo "✓ Applied ${keyList.size()} configuration(s) to ${selectedConfigmap}"
+            } else {
+                echo "⚠ No variables to apply"
             }
-
+            
             yaml.data["application.yml"] = yaml_application
             if (yaml.metadata) {
                 yaml.metadata.remove('resourceVersion')
@@ -251,6 +531,7 @@ def updateConfigmap(USER, BASTION, selectedConfigmap, selectedNamespace){
     backupAndDeploy(USER, BASTION)
 }
 
+
 node("built-in") {
 
     stage("Login OCP DC2"){
@@ -258,75 +539,178 @@ node("built-in") {
             wait: true, 
             propagate: true       
     }
-    stage("Enter module") {
-            env.MODULES = input message: 'Enter module here !!!', 
-                                ok: 'OK', 
-                                parameters: [
-                                    text(
-                                    defaultValue: '', 
-                                    description: 'Enter module here !!!', 
-                                    name: 'MODULES', 
-                                    trim: true
-                                    )
-                                ]                             
-    }    
-    stage("Enter variables") {
-            env.UPDATE_VARIABLES = input message: 'Enter variables here !!!', 
-                                ok: 'UPADTE', 
-                                parameters: [
-                                    text(
-                                    defaultValue: '', 
-                                    description: 'Enter variables here !!!', 
-                                    name: 'UPDATE_VARIABLES', 
-                                    trim: true
-                                    )
-                                ]                  
-    }    
+
+    stage("Enter Configuration") {
+            env.MODULE_CONFIG = input message: 'Enter Module Configuration (YAML format)', 
+                                    ok: 'PROCESS', 
+                                    parameters: [
+                                        text(
+                                        defaultValue: '', 
+                                        description: '''Example:
+    authentication:
+    dev:
+        variables:
+        server:
+            port: 80
+            timeout: 30
+        logging:
+            level: DEBUG
+    all:
+        variables:
+        server:
+            port: 8080
+            timeout: 3
+        logging:
+            level: ERROR
+
+    database:
+    staging:
+        variables:
+        database:
+            host: db.staging.local
+            port: 5432
+    all:
+        variables:
+        database:
+            host: db.prod.local
+            port: 5432
+
+    cache:
+    all:
+        variables:
+        redis:
+            host: redis.local
+            port: 6379
+    ''', 
+                                        name: 'MODULE_CONFIG', 
+                                        trim: true
+                                        )
+                                    ]                  
+        }
+
+    // Parse configuration
+    def moduleConfigs = parseModuleConfigWithVariables(env.MODULE_CONFIG)
+    
+    if (!moduleConfigs || moduleConfigs.isEmpty()) {
+        echo "❌ No configuration found!"
+        currentBuild.result = 'FAILED'
+        return
+    }
+    
+    echo "✓ Parsed ${moduleConfigs.size()} module(s)"
+    moduleConfigs.each { moduleName, nsConfigs ->
+        echo "  - ${moduleName}: ${nsConfigs.keySet().join(', ')}"
+    }
+    
+    // Generate task list
+    def taskList = processModuleConfigurations(moduleConfigs, NAMESPACES, BASTIONS)
+    echo "✓ Generated ${taskList.size()} task(s)"
+    
+    // ===== PRINT PREVIEW TRƯỚC KHI APPLY =====
+    stage("Preview Changes") {
+        printAllChangesPreview(taskList)
+        
+        timeout(time: 30, unit: 'MINUTES') {
+            input message: '✅ Proceed with deployment?', ok: 'DEPLOY'
+        }
+    }
+
     def configmapsForUpdate = [:]
     def deploymentNeedsRollout = [:]
-    BASTIONS.each { bastionHost ->
-        configmapsForUpdate["${bastionHost}"] = {
-            stage("Choose Configmap - ${bastionHost}"){
+    
+    taskList.each { task ->
+        def taskKey = "${task.bastion}-${task.moduleName}-${task.namespace}"
+        
+        configmapsForUpdate[taskKey] = {
+            stage("Update ${task.moduleName} [${task.namespace}@${task.bastion}]"){
                 lock(resource: 'yaml-processing', quantity: 1) {
-                    NAMESPACES.each { selectedNamespace ->
-                            def configmaps = sh(
-                                            script: """
-                                                ssh ${USER}@${bastionHost} kubectl get configmap -n ${selectedNamespace} | awk 'NR > 1 {print \$1}'
-                                                    """,
-                                            returnStdout: true
-                                        ).trim()                                                              
-                            def bestCandidate =  getBestMatch(env.MODULES, configmaps.split("\n"))    
-                            echo "Best candidate: ${bestCandidate}"             
-                            if (bestCandidate != null) {
-                                updateConfigmap(USER, bastionHost, bestCandidate, selectedNamespace)
-                                def jobB = build job: "FuzzySearchDeployment", 
-                                    wait: true, 
-                                    propagate: true,
-                                    parameters: [
-                                      string(name: 'MODULES', value: env.MODULES),
-                                      string(name: 'NAMESPACE', value: selectedNamespace),
-                                      string(name: 'BASTION_HOST', value: bastionHost)
-                                    ]
-                                def output = jobB.description      
-                                deploymentNeedsRollout["${bastionHost}"] = (deploymentNeedsRollout["${bastionHost}"] ?: "") + (output ? "${output}\n" : "")   
-                                                    
-                            }
+                    // Fuzzy search ConfigMap dựa trên module name
+                    def foundConfigmap = findConfigmapInNamespace(USER, task.bastion, task.namespace, 
+                                                                   task.moduleName, task.moduleName)
+                    
+                    if (foundConfigmap) {
+                        echo "✓ Found ConfigMap: ${foundConfigmap}"
+                        echo "  Applying config from: ${task.configSource}"
+                        
+                        // Cập nhật ConfigMap với variables
+                        updateConfigmap(USER, task.bastion, foundConfigmap, task.namespace, task.variables)
+                        
+                        // Trigger deployment rollout
+                        try {
+                            def jobB = build job: "FuzzySearchDeployment", 
+                                wait: true, 
+                                propagate: false,
+                                parameters: [
+                                  string(name: 'MODULES', value: task.moduleName),
+                                  string(name: 'NAMESPACE', value: task.namespace),
+                                  string(name: 'BASTION_HOST', value: task.bastion)
+                                ]
+                            def output = jobB.description      
+                            deploymentNeedsRollout[taskKey] = (deploymentNeedsRollout[taskKey] ?: "") + (output ? "${output}\n" : "")
+                            echo "✓ Deployment triggered"
+                        } catch (Exception e) {
+                            echo "⚠️ Deployment trigger failed: ${e.message}"
+                            deploymentNeedsRollout[taskKey] = "FAILED"
+                        }
+                    } else {
+                        echo "❌ ConfigMap for module '${task.moduleName}' not found in namespace '${task.namespace}'"
+                        currentBuild.result = 'UNSTABLE'
                     }
                 }
-
             }
         }
     }
-        parallel configmapsForUpdate  
-        stage("Rollout Deployment"){
-            parallel BASTIONS.collectEntries { bastionHost ->
-                ["Rollout Deployment - ${bastionHost}": {
-                    lock(resource: 'deployment-processing', quantity: 1) {
-                        echo deploymentNeedsRollout["${bastionHost}"]
-                    }
-                }]
-            }
+    if (configmapsForUpdate.isEmpty()) {
+        echo "No tasks to process!"
+        currentBuild.result = 'UNSTABLE'
+    } else {
+        parallel configmapsForUpdate
+    }
+stage("Deployment Summary"){
+        echo """
+╔════════════════════════════════════════════════════════════════════╗
+║                     ✓ DEPLOYMENT SUMMARY                          ║
+╚════════════════════════════════════════════════════════════════════╝
+"""
+        // Group theo Bastion
+        def groupedByBastion = deploymentNeedsRollout.groupBy { taskKey, output ->
+            taskKey.split('-')[0]  // Lấy bastion (phần đầu của taskKey)
         }
-
-
+        
+        groupedByBastion.each { bastion, results ->
+            echo """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🖥️  BASTION: ${bastion}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+            
+            // Group theo Module
+            def groupedByModule = results.groupBy { taskKey, output ->
+                def parts = taskKey.split('-')
+                parts[1]  // Lấy module name (phần thứ 2)
+            }
+            
+            groupedByModule.each { module, moduleResults ->
+                echo "  📦 Module: ${module}"
+                
+                moduleResults.each { taskKey, output ->
+                    def parts = taskKey.split('-')
+                    def namespace = parts[2]  // Lấy namespace (phần thứ 3)
+                    
+                    def status = output == "FAILED" ? "❌ FAILED" : "✓ SUCCESS"
+                    echo "      [${status}] ${namespace}"
+                    
+                    if (output && output != "FAILED") {
+                        echo "          ${output.trim()}"
+                    }
+                }
+            }
+            
+            echo ""
+        }
+        
+        echo "╔════════════════════════════════════════════════════════════════════╗"
+        echo "║                  ✓ ALL DEPLOYMENTS COMPLETED                      ║"
+        echo "╚════════════════════════════════════════════════════════════════════╝"
+    }
 }
