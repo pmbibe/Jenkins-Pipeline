@@ -4,15 +4,8 @@ def BASTIONS = ['']
 def USER = ''
 def NAMESPACES= ['', '', '']
 
-// ====== NEW FUNCTIONS FOR MODULE CONFIGURATION PROCESSING ======
-
-
 def findConfigmapInNamespace(String user, String bastion, String namespace, 
                              String searchTerm, String moduleName) {
-    /**
-     * Tìm ConfigMap tương ứng với searchTerm trong namespace
-     * Sử dụng getBestMatch để fuzzy search
-     */
     def configmaps = sh(
         script: """
             ssh ${user}@${bastion} kubectl get configmap -n ${namespace} | awk 'NR > 1 {print \$1}'
@@ -29,29 +22,12 @@ def findConfigmapInNamespace(String user, String bastion, String namespace,
     return bestCandidate
 }
 
-// ====== END NEW FUNCTIONS ======
-
 def parseModuleConfigWithVariables(String yamlString) {
-    /**
-     * Parse cấu trúc mới:
-     * authentication:
-     *   dev:
-     *     variables: {...}
-     *   staging:
-     *     variables: {...}
-     *   all:
-     *     variables: {...}
-     */
     def yaml = new Yaml().load(yamlString)
     return yaml ?: [:]
 }
 
 def expandConfigmapNamespaces(def namespaceValue, List<String> definedNamespaces) {
-    /**
-     * Xử lý namespace value có thể là:
-     * - String "dev" hoặc "All"
-     * - List ["dev", "staging"]
-     */
     def result = []
     
     if (namespaceValue instanceof String) {
@@ -79,14 +55,6 @@ def expandConfigmapNamespaces(def namespaceValue, List<String> definedNamespaces
 
 def processModuleConfigurations(Map moduleConfigs, List<String> definedNamespaces, 
                                 List<String> bastions) {
-    /**
-     * Tạo task list:
-     * - Lặp qua từng module
-     * - Lặp qua từng namespace config (dev, staging, all, etc)
-     * - Nếu là "all" → apply cho tất cả namespaces trong definedNamespaces
-     * - Nếu là namespace cụ thể → apply chỉ cho namespace đó
-     * - Merge variables nếu vừa có "all" vừa có namespace cụ thể
-     */
     def taskList = []
     
     moduleConfigs.each { moduleName, namespaceConfigs ->
@@ -95,7 +63,7 @@ def processModuleConfigurations(Map moduleConfigs, List<String> definedNamespace
             return
         }
         
-        // Lấy variables từ "all" nếu có (default)
+        // Step 1: Lấy "all" variables
         def allVariables = [:]
         if (namespaceConfigs.containsKey('all')) {
             def allConfig = namespaceConfigs.all
@@ -104,77 +72,116 @@ def processModuleConfigurations(Map moduleConfigs, List<String> definedNamespace
             }
         }
         
-        // Xử lý từng namespace
-        namespaceConfigs.each { nsKey, nsConfig ->
-            // Bỏ qua key "all" vì đã xử lý rồi
-            if (nsKey == 'all') {
-                return
-            }
+        // Step 2: Xác định target namespaces
+        def hasAllConfig = namespaceConfigs.containsKey('all')
+        def specificNamespaces = namespaceConfigs.keySet().findAll { 
+            it != 'all' && definedNamespaces.contains(it.toString()) 
+        }
+        
+        // ✅ LOGIC CHÍNH: Nếu có "all" → tất cả defined namespaces phải được xử lý
+        if (hasAllConfig) {
+            echo "📍 Module '${moduleName}': Detected 'all' config → applying to ${definedNamespaces.size()} namespace(s): ${definedNamespaces.join(', ')}"
             
-            if (!(nsConfig instanceof Map) || !nsConfig.containsKey('variables')) {
-                echo "⚠️ WARNING: Namespace '${nsKey}' under module '${moduleName}' has no variables, skipping"
-                return
-            }
-            
-            def targetNamespaces = []
-            
-            // Kiểm tra xem nsKey là "all" hay namespace cụ thể
-            if (nsKey.toString().equalsIgnoreCase("all")) {
-                targetNamespaces = definedNamespaces
-            } else if (definedNamespaces.contains(nsKey.toString())) {
-                targetNamespaces = [nsKey.toString()]
-            } else {
-                echo "⚠️ WARNING: Namespace '${nsKey}' not found in defined namespaces, skipping"
-                return
-            }
-            
-            // Merge variables: all variables + namespace-specific variables
-            def mergedVariables = deepMergeMap(allVariables, nsConfig.variables ?: [:])
-            
-            targetNamespaces.each { targetNamespace ->
+            definedNamespaces.each { targetNamespace ->
+                // Lấy variables: specific (nếu có) + all (base)
+                def variables = allVariables.clone()
+                def configSource = 'all'
+                
+                if (specificNamespaces.contains(targetNamespace)) {
+                    def specificConfig = namespaceConfigs[targetNamespace]
+                    if (specificConfig instanceof Map && specificConfig.containsKey('variables')) {
+                        variables = deepMergeMap(allVariables, specificConfig.variables ?: [:])
+                        configSource = targetNamespace + " (merged with all)"
+                    }
+                }
+                
                 bastions.each { bastion ->
                     taskList.add([
                         moduleName: moduleName,
                         namespace: targetNamespace,
                         bastion: bastion,
-                        variables: mergedVariables,
-                        configSource: nsKey  // Để biết thay đổi từ namespace nào
+                        variables: variables,
+                        configSource: configSource
                     ])
                 }
             }
-        }
-        
-        // Xử lý "all" - apply cho tất cả namespaces nếu chỉ có "all" và không có config namespace cụ thể
-        if (namespaceConfigs.containsKey('all')) {
-            def hasSpecificNamespace = namespaceConfigs.keySet().any { 
-                it != 'all' && definedNamespaces.contains(it.toString()) 
-            }
+        } else if (!specificNamespaces.isEmpty()) {
+            // Nếu KHÔNG có "all" nhưng có namespace cụ thể → chỉ apply những namespace đó
+            echo "📍 Module '${moduleName}': Applying to ${specificNamespaces.size()} specific namespace(s): ${specificNamespaces.join(', ')}"
             
-            if (!hasSpecificNamespace) {
-                definedNamespaces.each { targetNamespace ->
-                    bastions.each { bastion ->
-                        taskList.add([
-                            moduleName: moduleName,
-                            namespace: targetNamespace,
-                            bastion: bastion,
-                            variables: allVariables,
-                            configSource: 'all'
-                        ])
-                    }
+            specificNamespaces.each { nsKey ->
+                def nsConfig = namespaceConfigs[nsKey]
+                if (!(nsConfig instanceof Map) || !nsConfig.containsKey('variables')) {
+                    echo "⚠️ WARNING: Namespace '${nsKey}' has no variables, skipping"
+                    return
+                }
+                
+                bastions.each { bastion ->
+                    taskList.add([
+                        moduleName: moduleName,
+                        namespace: nsKey.toString(),
+                        bastion: bastion,
+                        variables: nsConfig.variables ?: [:],
+                        configSource: nsKey.toString()
+                    ])
                 }
             }
+        } else {
+            echo "⚠️ WARNING: Module '${moduleName}' has no valid namespace config (no 'all' or specific namespaces)"
         }
     }
     
     return taskList
 }
 
+def printAllChangesPreview(List<Map> taskList) {
+    echo """
+
+╔════════════════════════════════════════════════════════════════════╗
+║                  📋 CONFIGURATION CHANGES PREVIEW                 ║
+║                  Total: ${String.format('%d', taskList.size())} change(s)                            ║
+╚════════════════════════════════════════════════════════════════════╝
+"""
+    
+    def groupedByModule = taskList.groupBy { it.moduleName }
+    
+    groupedByModule.each { moduleName, tasks ->
+        echo """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🔧 MODULE: ${moduleName}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        def groupedByNamespace = tasks.groupBy { it.namespace }
+        
+        groupedByNamespace.each { namespace, nsTasks ->
+            def firstTask = nsTasks.first()
+            def configSourceInfo = firstTask.configSource
+            
+            echo """
+  📍 Namespace: ${String.format('%-20s', namespace)} (config source: ${configSourceInfo})
+     Bastions: ${nsTasks.collect { it.bastion }.unique().join(', ')}
+     
+"""
+            
+            def yamlDump = new Yaml().dumpAs(firstTask.variables, null, DumperOptions.FlowStyle.BLOCK)
+            def indentedYaml = yamlDump.split('\n').collect { line -> "     ${line}" }.join('\n')
+            
+            echo indentedYaml
+            echo "\n"
+        }
+    }
+    
+    echo """
+╔════════════════════════════════════════════════════════════════════╗
+║              ⚠️  Please review above before proceeding!            ║
+║              Check that ALL expected namespaces are present        ║
+╚════════════════════════════════════════════════════════════════════╝
+"""
+}
+
 def deepMergeMap(Map base, Map override) {
-    /**
-     * Merge 2 maps - override values sẽ ghi đè base values
-     * Nếu value là map → recursive merge
-     * Nếu value khác → override lấy giá trị mới
-     */
+
     def result = base.clone()
     
     override.each { key, value ->
@@ -190,9 +197,7 @@ def deepMergeMap(Map base, Map override) {
 
 
 def printChangePreview(Map task) {
-    /**
-     * In preview thay đổi chi tiết cho 1 task
-     */
+
     def yamlDump = new Yaml().dumpAs(task.variables, null, DumperOptions.FlowStyle.BLOCK)
     def indentedYaml = yamlDump.split('\n').collect { line -> "  ${line}" }.join('\n')
     
@@ -212,67 +217,9 @@ ${indentedYaml.split('\n').collect { "│ " + String.format('%-60s', it) + "│"
     
     return preview
 }
-def printAllChangesPreview(List<Map> taskList) {
-    /**
-     * In preview tất cả thay đổi grouped by Module
-     * Hiển thị tất cả namespaces từ taskList (đã bao gồm tất cả defined namespaces)
-     */
-    echo """
-
-╔════════════════════════════════════════════════════════════════════╗
-║                  📋 CONFIGURATION CHANGES PREVIEW                 ║
-║                  Total: ${String.format('%d', taskList.size())} change(s)                            ║
-╚════════════════════════════════════════════════════════════════════╝
-"""
-    
-    // Group by module
-    def groupedByModule = taskList.groupBy { it.moduleName }
-    
-    groupedByModule.each { moduleName, tasks ->
-        echo """
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  🔧 MODULE: ${moduleName}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-        
-        // Group theo namespace để dễ nhìn
-        def groupedByNamespace = tasks.groupBy { it.namespace }
-        
-        groupedByNamespace.each { namespace, nsTasks ->
-            // Lấy task đầu tiên để hiển thị (vì variables giống nhau, chỉ khác bastion)
-            def firstTask = nsTasks.first()
-            
-            echo """
-  📍 Namespace: ${String.format('%-20s', namespace)} (config source: ${firstTask.configSource})
-     
-"""
-            
-            def yamlDump = new Yaml().dumpAs(firstTask.variables, null, DumperOptions.FlowStyle.BLOCK)
-            def indentedYaml = yamlDump.split('\n').collect { line -> "     ${line}" }.join('\n')
-            
-            echo indentedYaml
-            
-            echo """
-     Applying to bastions: ${nsTasks.collect { it.bastion }.unique().join(', ')}
-     
-"""
-        }
-    }
-    
-    echo """
-╔════════════════════════════════════════════════════════════════════╗
-║              ⚠️  Please review above before proceeding!            ║
-╚════════════════════════════════════════════════════════════════════╝
-"""
-}
-
-
 
 def convertVariablesToUpdateFormat(Map variables) {
-    /**
-     * Chuyển đổi variables YAML thành format mà setValueForKeyPath có thể dùng
-     * Trả về: YAML string để load vào updateConfigmap
-     */
+
     def yaml = new Yaml()
     return yaml.dumpAs(variables, null, DumperOptions.FlowStyle.BLOCK)
 }
@@ -619,7 +566,7 @@ node("built-in") {
     def deploymentNeedsRollout = [:]
     
     taskList.each { task ->
-        def taskKey = "${task.bastion}-${task.moduleName}-${task.namespace}"
+        def taskKey = "${task.bastion}+${task.moduleName}+${task.namespace}"
         
         configmapsForUpdate[taskKey] = {
             stage("Update ${task.moduleName} [${task.namespace}@${task.bastion}]"){
@@ -674,7 +621,7 @@ stage("Deployment Summary"){
 """
         // Group theo Bastion
         def groupedByBastion = deploymentNeedsRollout.groupBy { taskKey, output ->
-            taskKey.split('-')[0]  // Lấy bastion (phần đầu của taskKey)
+            taskKey.split('\\+')[0]  // Lấy bastion (phần đầu của taskKey)
         }
         
         groupedByBastion.each { bastion, results ->
@@ -686,20 +633,14 @@ stage("Deployment Summary"){
             
             // Group theo Module
             def groupedByModule = results.groupBy { taskKey, output ->
-                def parts = taskKey.split('-')
-                parts[1]  // Lấy module name (phần thứ 2)
+                def parts = taskKey.split('\\+')
+                parts[1]
             }
             
             groupedByModule.each { module, moduleResults ->
-                echo "  📦 Module: ${module}"
-                
                 moduleResults.each { taskKey, output ->
-                    def parts = taskKey.split('-')
-                    def namespace = parts[2]  // Lấy namespace (phần thứ 3)
-                    
+                    def parts = taskKey.split('\\+')
                     def status = output == "FAILED" ? "❌ FAILED" : "✓ SUCCESS"
-                    echo "      [${status}] ${namespace}"
-                    
                     if (output && output != "FAILED") {
                         echo "          ${output.trim()}"
                     }
