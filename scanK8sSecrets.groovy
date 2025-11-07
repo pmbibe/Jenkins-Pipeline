@@ -56,40 +56,45 @@ def passwordsToFind = null
 
 // ==================== HELPER FUNCTIONS ====================
 
-@NonCPS
 def getAllNamespaces(String user, String host) {
     """Get all namespaces except those starting with 'openshift'"""
-    def namespaces = sh(
+    def output = sh(
         script: """
             ssh ${user}@${host} 'kubectl get namespaces -o name | cut -d"/" -f2 | grep -v "^openshift"'
         """,
         returnStdout: true
     ).trim()
 
-    return namespaces ? namespaces.split('\n').collect { it.trim() } : []
+    if (!output) {
+        return []
+    }
+
+    // Split by newlines and filter out empty strings
+    def namespaces = output.split('\n').collect { it.trim() }.findAll { it }
+    return namespaces
 }
 
-@NonCPS
 def scanConfigMapsForPasswords(String user, String host, String namespace, List passwordsToFind) {
     """Scan all ConfigMaps in a namespace for matching passwords"""
     def findings = []
 
     try {
         // Get list of ConfigMaps
-        def configMaps = sh(
+        def output = sh(
             script: """
                 ssh ${user}@${host} 'kubectl get configmap -n ${namespace} -o name | cut -d"/" -f2'
             """,
             returnStdout: true
         ).trim()
 
-        if (!configMaps) {
+        if (!output) {
             return findings
         }
 
-        configMaps.split('\n').each { configMapName ->
-            configMapName = configMapName.trim()
-            if (!configMapName) return
+        // Split by newlines and filter out empty strings
+        def configMapList = output.split('\n').collect { it.trim() }.findAll { it }
+
+        configMapList.each { configMapName ->
 
             try {
                 // Get ConfigMap YAML
@@ -110,9 +115,10 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                 if (!password) return
 
                                 if (value.contains('=')) {
-                                    // Handle KEY=VALUE format
-                                    value.split('\n').each { line ->
-                                        def parts = line.trim().split('=', 2)
+                                    // Handle KEY=VALUE format (multi-line properties)
+                                    def lines = value.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
+                                    lines.each { line ->
+                                        def parts = line.split('=', 2)
                                         if (parts.length == 2 && parts[1] == password) {
                                             findings << [
                                                 type: 'ConfigMap',
@@ -148,27 +154,27 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
     return findings
 }
 
-@NonCPS
 def scanSecretsForPasswords(String user, String host, String namespace, List passwordsToFind) {
     """Scan all Secrets in a namespace for matching passwords"""
     def findings = []
 
     try {
         // Get list of Secrets
-        def secrets = sh(
+        def output = sh(
             script: """
                 ssh ${user}@${host} 'kubectl get secret -n ${namespace} -o name | cut -d"/" -f2'
             """,
             returnStdout: true
         ).trim()
 
-        if (!secrets) {
+        if (!output) {
             return findings
         }
 
-        secrets.split('\n').each { secretName ->
-            secretName = secretName.trim()
-            if (!secretName) return
+        // Split by newlines and filter out empty strings
+        def secretList = output.split('\n').collect { it.trim() }.findAll { it }
+
+        secretList.each { secretName ->
 
             try {
                 // Get Secret YAML
@@ -193,9 +199,10 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                     if (!password) return
 
                                     if (decodedValue.contains('=')) {
-                                        // Handle KEY=VALUE format
-                                        decodedValue.split('\n').each { line ->
-                                            def parts = line.trim().split('=', 2)
+                                        // Handle KEY=VALUE format (multi-line properties)
+                                        def lines = decodedValue.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
+                                        lines.each { line ->
+                                            def parts = line.split('=', 2)
                                             if (parts.length == 2 && parts[1] == password) {
                                                 findings << [
                                                     type: 'Secret',
@@ -234,7 +241,6 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
     return findings
 }
 
-@NonCPS
 def printFindings(String host, Map<String, List> findingsByNamespace) {
     """Print findings in a structured format"""
 
