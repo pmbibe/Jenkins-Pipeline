@@ -242,42 +242,56 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
 }
 
 def printFindings(String host, Map<String, List> findingsByNamespace) {
-    """Print findings in a structured format"""
+    """Save findings to artifact file and print summary"""
 
     if (findingsByNamespace.isEmpty()) {
-        echo """
-┌────────────────────────────────────────────────────────────────┐
-│  ✓ No matching passwords found on host: ${host.padRight(27)} │
-└────────────────────────────────────────────────────────────────┘
-"""
+        echo "✓ No matching passwords found on host: ${host}"
         return
     }
 
+    // Build file content
+    def fileContent = new StringBuilder()
+    fileContent.append("=" * 80).append("\n")
+    fileContent.append("Password Findings Report - Host: ${host}\n")
+    fileContent.append("=" * 80).append("\n\n")
+
+    def totalFindings = 0
+
+    findingsByNamespace.each { namespace, findings ->
+        fileContent.append("Namespace: ${namespace}\n")
+        fileContent.append("-" * 80).append("\n")
+
+        findings.each { finding ->
+            // Format: ConfigMap: configmap-name ----- key.subkey = password
+            fileContent.append("${finding.type}: ${finding.name} ----- ${finding.key} = ${finding.password}\n")
+            totalFindings++
+        }
+
+        fileContent.append("\n")
+    }
+
+    fileContent.append("=" * 80).append("\n")
+    fileContent.append("Total findings: ${totalFindings}\n")
+    fileContent.append("=" * 80).append("\n")
+
+    // Save to file
+    def fileName = "password-findings-${host.replaceAll('[^a-zA-Z0-9-]', '_')}-${BUILD_NUMBER}.txt"
+    writeFile file: fileName, text: fileContent.toString()
+
+    // Archive as Jenkins artifact
+    archiveArtifacts artifacts: fileName, allowEmptyArchive: false
+
+    // Print summary to console
     echo """
 ╔════════════════════════════════════════════════════════════════╗
 ║  🔍 Password Findings on Host: ${host.padRight(30)} ║
 ╚════════════════════════════════════════════════════════════════╝
-"""
 
-    findingsByNamespace.each { namespace, findings ->
-        echo """
-  📦 Namespace: ${namespace}
-  ─────────────────────────────────────────────────────────────"""
+  📊 Total findings: ${totalFindings}
+  📦 Namespaces scanned: ${findingsByNamespace.size()}
+  📄 Results saved to artifact: ${fileName}
 
-        findings.each { finding ->
-            echo "    • ${finding.type}: ${finding.name}"
-            echo "      Key: ${finding.key}"
-            echo "      Password: ${finding.password}"
-            echo ""
-        }
-    }
-
-    // Summary
-    def totalFindings = findingsByNamespace.values().flatten().size()
-    echo """
-╔════════════════════════════════════════════════════════════════╗
-║  📊 Total findings on ${host}: ${String.valueOf(totalFindings).padRight(33)} ║
-╚════════════════════════════════════════════════════════════════╝
+  ✓ You can download the full report from Jenkins artifacts
 """
 }
 
@@ -368,22 +382,71 @@ Passwords to find: ${passwordsToFind.size()} password(s)
 """
 
         def grandTotal = 0
+        def summaryContent = new StringBuilder()
+
+        summaryContent.append("=" * 100).append("\n")
+        summaryContent.append("KUBERNETES PASSWORD SCAN - CONSOLIDATED REPORT\n")
+        summaryContent.append("Build: ${BUILD_NUMBER}\n")
+        summaryContent.append("Date: ${new Date()}\n")
+        summaryContent.append("=" * 100).append("\n\n")
+
         allFindings.each { host, findingsByNamespace ->
             def hostTotal = findingsByNamespace.values().flatten().size()
             grandTotal += hostTotal
+
+            summaryContent.append("\n")
+            summaryContent.append("*" * 100).append("\n")
+            summaryContent.append("HOST: ${host}\n")
+            summaryContent.append("*" * 100).append("\n\n")
+
+            if (findingsByNamespace.isEmpty()) {
+                summaryContent.append("✓ No matching passwords found on this host\n")
+            } else {
+                findingsByNamespace.each { namespace, findings ->
+                    summaryContent.append("Namespace: ${namespace}\n")
+                    summaryContent.append("-" * 100).append("\n")
+
+                    findings.each { finding ->
+                        summaryContent.append("${finding.type}: ${finding.name} ----- ${finding.key} = ${finding.password}\n")
+                    }
+                    summaryContent.append("\n")
+                }
+            }
+
             echo "  ${host}: ${hostTotal} finding(s)"
         }
 
-        echo """
+        summaryContent.append("\n")
+        summaryContent.append("=" * 100).append("\n")
+        summaryContent.append("SUMMARY\n")
+        summaryContent.append("=" * 100).append("\n")
+        summaryContent.append("Total hosts scanned: ${HOSTS.size()}\n")
+        summaryContent.append("Total findings across all hosts: ${grandTotal}\n")
+        summaryContent.append("=" * 100).append("\n")
+
+        // Save consolidated report
+        if (grandTotal > 0) {
+            def summaryFileName = "password-findings-ALL-HOSTS-${BUILD_NUMBER}.txt"
+            writeFile file: summaryFileName, text: summaryContent.toString()
+            archiveArtifacts artifacts: summaryFileName, allowEmptyArchive: false
+
+            echo """
 ╔════════════════════════════════════════════════════════════════╗
 ║  Total findings across all hosts: ${String.valueOf(grandTotal).padRight(28)} ║
 ╚════════════════════════════════════════════════════════════════╝
-"""
 
-        if (grandTotal > 0) {
-            echo "⚠️  Action required: Review and rotate the identified passwords"
+  ⚠️  Action required: Review and rotate the identified passwords
+  📄 Consolidated report: ${summaryFileName}
+  ✓ All reports saved as Jenkins artifacts
+"""
         } else {
-            echo "✓ No matching passwords found. Configuration appears secure."
+            echo """
+╔════════════════════════════════════════════════════════════════╗
+║  Total findings across all hosts: 0                           ║
+╚════════════════════════════════════════════════════════════════╝
+
+  ✓ No matching passwords found. Configuration appears secure.
+"""
         }
     }
 }
