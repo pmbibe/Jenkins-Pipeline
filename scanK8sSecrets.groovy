@@ -23,14 +23,15 @@
  *   - Scans ALL namespaces EXCEPT those starting with "openshift*"
  *   - Checks both ConfigMaps and Secrets
  *   - Compares all values against the passwordsToFind list
- *   - Each host is processed as a separate STAGE for clarity
+ *   - Hosts are scanned IN PARALLEL for optimal performance
+ *   - Each host generates a separate artifact file
  *
  * OUTPUT:
- *   Results are organized by:
- *   - Host (BASTION/SERVER)
- *   - Namespace
- *   - Resource type (ConfigMap/Secret)
- *   - Resource name and key
+ *   - Per-host artifact files: password-findings-{host}-{BUILD_NUMBER}.txt
+ *   - Consolidated report: password-findings-ALL-HOSTS-{BUILD_NUMBER}.txt
+ *   - Format: {ResourceType}: {name} ----- {key} = {password}
+ *   - All files saved as Jenkins artifacts for download
+ *   - Console shows summary only (no detailed findings)
  *
  * EXAMPLE CONFIGURATION:
  *   USER = 'jenkins'
@@ -41,6 +42,11 @@
  *       'weakPassword123',
  *       'defaultPass456'
  *   ]
+ *
+ * PERFORMANCE:
+ *   - Multiple hosts are scanned in parallel (significant time savings)
+ *   - Example: 3 hosts taking 10min each = ~10min total (vs 30min sequential)
+ *   - Each host runs independently without blocking others
  *
  * ==============================================================================
  */
@@ -329,47 +335,62 @@ Passwords to find: ${passwordsToFind.size()} password(s)
 """
 
     def allFindings = [:]
+    def parallelStages = [:]
 
-    // Process each host as a separate stage
+    // Build parallel stages for each host
     HOSTS.each { host ->
-        stage("Scan Host: ${host}") {
-            echo "🖥️  Starting scan on host: ${host}"
+        // Capture host variable in closure scope
+        def currentHost = host
 
-            try {
-                // Get all namespaces (excluding openshift*)
-                def namespaces = getAllNamespaces(USER, host)
-                echo "  ✓ Found ${namespaces.size()} namespace(s) to scan"
+        parallelStages["Scan Host: ${currentHost}"] = {
+            stage("Scan: ${currentHost}") {
+                echo "🖥️  Starting scan on host: ${currentHost}"
 
-                def hostFindings = [:]
+                try {
+                    // Get all namespaces (excluding openshift*)
+                    def namespaces = getAllNamespaces(USER, currentHost)
+                    echo "  ✓ Found ${namespaces.size()} namespace(s) to scan"
 
-                namespaces.each { namespace ->
-                    echo "  📦 Scanning namespace: ${namespace}"
+                    def hostFindings = [:]
 
-                    // Scan ConfigMaps
-                    def configMapFindings = scanConfigMapsForPasswords(USER, host, namespace, passwordsToFind)
+                    namespaces.each { namespace ->
+                        echo "  📦 Scanning namespace: ${namespace}"
 
-                    // Scan Secrets
-                    def secretFindings = scanSecretsForPasswords(USER, host, namespace, passwordsToFind)
+                        // Scan ConfigMaps
+                        def configMapFindings = scanConfigMapsForPasswords(USER, currentHost, namespace, passwordsToFind)
 
-                    def allNamespaceFindings = configMapFindings + secretFindings
+                        // Scan Secrets
+                        def secretFindings = scanSecretsForPasswords(USER, currentHost, namespace, passwordsToFind)
 
-                    if (allNamespaceFindings) {
-                        hostFindings[namespace] = allNamespaceFindings
-                        echo "    ✓ Found ${allNamespaceFindings.size()} matching password(s)"
+                        def allNamespaceFindings = configMapFindings + secretFindings
+
+                        if (allNamespaceFindings) {
+                            hostFindings[namespace] = allNamespaceFindings
+                            echo "    ✓ Found ${allNamespaceFindings.size()} matching password(s)"
+                        }
                     }
+
+                    // Store findings for this host (synchronized access)
+                    synchronized(allFindings) {
+                        allFindings[currentHost] = hostFindings
+                    }
+
+                    // Print findings for this host
+                    printFindings(currentHost, hostFindings)
+
+                } catch (Exception e) {
+                    echo "❌ Error scanning host ${currentHost}: ${e.message}"
+                    currentBuild.result = 'UNSTABLE'
                 }
-
-                // Store findings for this host
-                allFindings[host] = hostFindings
-
-                // Print findings for this host
-                printFindings(host, hostFindings)
-
-            } catch (Exception e) {
-                echo "❌ Error scanning host ${host}: ${e.message}"
-                currentBuild.result = 'UNSTABLE'
             }
         }
+    }
+
+    // Execute all host scans in parallel
+    stage("Parallel Host Scanning") {
+        echo "🚀 Starting parallel scan of ${HOSTS.size()} host(s)..."
+        parallel parallelStages
+        echo "✓ Parallel scanning completed"
     }
 
     // Final summary stage
