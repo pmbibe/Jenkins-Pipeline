@@ -370,10 +370,9 @@ Passwords to find: ${passwordsToFind.size()} password(s)
                         }
                     }
 
-                    // Store findings for this host (synchronized access)
-                    synchronized(allFindings) {
-                        allFindings[currentHost] = hostFindings
-                    }
+                    // Store findings for this host
+                    // Safe without synchronization since each host writes to its own unique key
+                    allFindings[currentHost] = hostFindings
 
                     // Print findings for this host
                     printFindings(currentHost, hostFindings)
