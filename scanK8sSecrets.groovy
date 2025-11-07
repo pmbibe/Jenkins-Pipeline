@@ -1,0 +1,383 @@
+/*
+ * ==============================================================================
+ * Kubernetes ConfigMap & Secret Password Scanner
+ * ==============================================================================
+ *
+ * PURPOSE:
+ *   Scans Kubernetes ConfigMaps and Secrets across multiple hosts and namespaces
+ *   to identify which configuration variables contain values matching a target
+ *   password list.
+ *
+ * USAGE:
+ *   1. Configure the passwordsToFind list in passwordsToFind.groovy
+ *   2. Set the USER variable (SSH username)
+ *   3. Set the HOSTS list (BASTION/SERVER hosts to scan)
+ *   4. Run the Jenkins pipeline
+ *
+ * CONFIGURATION:
+ *   - USER: SSH username for connecting to hosts
+ *   - HOSTS: List of BASTION/SERVER hosts (treated as unified list)
+ *   - passwordsToFind: Loaded from passwordsToFind.groovy
+ *
+ * BEHAVIOR:
+ *   - Scans ALL namespaces EXCEPT those starting with "openshift*"
+ *   - Checks both ConfigMaps and Secrets
+ *   - Compares all values against the passwordsToFind list
+ *   - Each host is processed as a separate STAGE for clarity
+ *
+ * OUTPUT:
+ *   Results are organized by:
+ *   - Host (BASTION/SERVER)
+ *   - Namespace
+ *   - Resource type (ConfigMap/Secret)
+ *   - Resource name and key
+ *
+ * EXAMPLE CONFIGURATION:
+ *   USER = 'jenkins'
+ *   HOSTS = ['bastion1.example.com', 'bastion2.example.com']
+ *
+ *   In passwordsToFind.groovy:
+ *   def passwordsToFind = [
+ *       'weakPassword123',
+ *       'defaultPass456'
+ *   ]
+ *
+ * ==============================================================================
+ */
+
+import org.yaml.snakeyaml.Yaml
+
+// ==================== CONFIGURATION ====================
+def USER = ''  // SSH user for connecting to hosts
+def HOSTS = []  // Unified list of BASTION/SERVER hosts (e.g., ['host1.example.com', 'host2.example.com'])
+
+// Load passwords to find - will be loaded from passwordsToFind.groovy at runtime
+def passwordsToFind = null
+
+// ==================== HELPER FUNCTIONS ====================
+
+@NonCPS
+def getAllNamespaces(String user, String host) {
+    """Get all namespaces except those starting with 'openshift'"""
+    def namespaces = sh(
+        script: """
+            ssh ${user}@${host} 'kubectl get namespaces -o name | cut -d"/" -f2 | grep -v "^openshift"'
+        """,
+        returnStdout: true
+    ).trim()
+
+    return namespaces ? namespaces.split('\n').collect { it.trim() } : []
+}
+
+@NonCPS
+def scanConfigMapsForPasswords(String user, String host, String namespace, List passwordsToFind) {
+    """Scan all ConfigMaps in a namespace for matching passwords"""
+    def findings = []
+
+    try {
+        // Get list of ConfigMaps
+        def configMaps = sh(
+            script: """
+                ssh ${user}@${host} 'kubectl get configmap -n ${namespace} -o name | cut -d"/" -f2'
+            """,
+            returnStdout: true
+        ).trim()
+
+        if (!configMaps) {
+            return findings
+        }
+
+        configMaps.split('\n').each { configMapName ->
+            configMapName = configMapName.trim()
+            if (!configMapName) return
+
+            try {
+                // Get ConfigMap YAML
+                def yamlString = sh(
+                    script: """
+                        ssh ${user}@${host} 'kubectl get configmap ${configMapName} -n ${namespace} -o yaml'
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                def yaml = new Yaml().load(yamlString)
+
+                if (yaml?.data) {
+                    yaml.data.each { key, value ->
+                        if (value instanceof String) {
+                            // Check if value matches any password in the list
+                            passwordsToFind.each { password ->
+                                if (!password) return
+
+                                if (value.contains('=')) {
+                                    // Handle KEY=VALUE format
+                                    value.split('\n').each { line ->
+                                        def parts = line.trim().split('=', 2)
+                                        if (parts.length == 2 && parts[1] == password) {
+                                            findings << [
+                                                type: 'ConfigMap',
+                                                name: configMapName,
+                                                key: "${key}.${parts[0]}",
+                                                password: password,
+                                                namespace: namespace
+                                            ]
+                                        }
+                                    }
+                                } else if (value == password) {
+                                    // Direct value match
+                                    findings << [
+                                        type: 'ConfigMap',
+                                        name: configMapName,
+                                        key: key,
+                                        password: password,
+                                        namespace: namespace
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                echo "  ⚠️  Error scanning ConfigMap ${configMapName}: ${e.message}"
+            }
+        }
+    } catch (Exception e) {
+        echo "  ⚠️  Error listing ConfigMaps in namespace ${namespace}: ${e.message}"
+    }
+
+    return findings
+}
+
+@NonCPS
+def scanSecretsForPasswords(String user, String host, String namespace, List passwordsToFind) {
+    """Scan all Secrets in a namespace for matching passwords"""
+    def findings = []
+
+    try {
+        // Get list of Secrets
+        def secrets = sh(
+            script: """
+                ssh ${user}@${host} 'kubectl get secret -n ${namespace} -o name | cut -d"/" -f2'
+            """,
+            returnStdout: true
+        ).trim()
+
+        if (!secrets) {
+            return findings
+        }
+
+        secrets.split('\n').each { secretName ->
+            secretName = secretName.trim()
+            if (!secretName) return
+
+            try {
+                // Get Secret YAML
+                def yamlString = sh(
+                    script: """
+                        ssh ${user}@${host} 'kubectl get secret ${secretName} -n ${namespace} -o yaml'
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                def yaml = new Yaml().load(yamlString)
+
+                if (yaml?.data) {
+                    yaml.data.each { key, encodedValue ->
+                        if (encodedValue instanceof String) {
+                            try {
+                                // Decode base64 value
+                                def decodedValue = new String(encodedValue.decodeBase64())
+
+                                // Check if decoded value matches any password in the list
+                                passwordsToFind.each { password ->
+                                    if (!password) return
+
+                                    if (decodedValue.contains('=')) {
+                                        // Handle KEY=VALUE format
+                                        decodedValue.split('\n').each { line ->
+                                            def parts = line.trim().split('=', 2)
+                                            if (parts.length == 2 && parts[1] == password) {
+                                                findings << [
+                                                    type: 'Secret',
+                                                    name: secretName,
+                                                    key: "${key}.${parts[0]}",
+                                                    password: password,
+                                                    namespace: namespace
+                                                ]
+                                            }
+                                        }
+                                    } else if (decodedValue == password) {
+                                        // Direct value match
+                                        findings << [
+                                            type: 'Secret',
+                                            name: secretName,
+                                            key: key,
+                                            password: password,
+                                            namespace: namespace
+                                        ]
+                                    }
+                                }
+                            } catch (Exception decodeError) {
+                                // Skip if base64 decode fails
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                echo "  ⚠️  Error scanning Secret ${secretName}: ${e.message}"
+            }
+        }
+    } catch (Exception e) {
+        echo "  ⚠️  Error listing Secrets in namespace ${namespace}: ${e.message}"
+    }
+
+    return findings
+}
+
+@NonCPS
+def printFindings(String host, Map<String, List> findingsByNamespace) {
+    """Print findings in a structured format"""
+
+    if (findingsByNamespace.isEmpty()) {
+        echo """
+┌────────────────────────────────────────────────────────────────┐
+│  ✓ No matching passwords found on host: ${host.padRight(27)} │
+└────────────────────────────────────────────────────────────────┘
+"""
+        return
+    }
+
+    echo """
+╔════════════════════════════════════════════════════════════════╗
+║  🔍 Password Findings on Host: ${host.padRight(30)} ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+
+    findingsByNamespace.each { namespace, findings ->
+        echo """
+  📦 Namespace: ${namespace}
+  ─────────────────────────────────────────────────────────────"""
+
+        findings.each { finding ->
+            echo "    • ${finding.type}: ${finding.name}"
+            echo "      Key: ${finding.key}"
+            echo "      Password: ${finding.password}"
+            echo ""
+        }
+    }
+
+    // Summary
+    def totalFindings = findingsByNamespace.values().flatten().size()
+    echo """
+╔════════════════════════════════════════════════════════════════╗
+║  📊 Total findings on ${host}: ${String.valueOf(totalFindings).padRight(33)} ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+}
+
+// ==================== MAIN PIPELINE ====================
+
+node("built-in") {
+
+    // Load passwords from passwordsToFind.groovy
+    stage("Load Configuration") {
+        echo "📥 Loading password list from passwordsToFind.groovy..."
+
+        def passwordsScript = load "${WORKSPACE}/passwordsToFind.groovy"
+        passwordsToFind = passwordsScript
+
+        echo "✓ Loaded ${passwordsToFind?.size() ?: 0} password(s) to search for"
+    }
+
+    // Validate configuration
+    if (!HOSTS || HOSTS.isEmpty()) {
+        error "❌ HOSTS list is empty. Please configure at least one host."
+    }
+
+    if (!passwordsToFind || passwordsToFind.isEmpty()) {
+        error "❌ passwordsToFind list is empty. Please add passwords to search for in passwordsToFind.groovy"
+    }
+
+    echo """
+╔════════════════════════════════════════════════════════════════╗
+║         🔐 Kubernetes Password Scanner                        ║
+║         Scanning ${HOSTS.size()} host(s) for ${passwordsToFind.size()} password(s)          ║
+╚════════════════════════════════════════════════════════════════╝
+
+Hosts: ${HOSTS.join(', ')}
+Passwords to find: ${passwordsToFind.size()} password(s)
+"""
+
+    def allFindings = [:]
+
+    // Process each host as a separate stage
+    HOSTS.each { host ->
+        stage("Scan Host: ${host}") {
+            echo "🖥️  Starting scan on host: ${host}"
+
+            try {
+                // Get all namespaces (excluding openshift*)
+                def namespaces = getAllNamespaces(USER, host)
+                echo "  ✓ Found ${namespaces.size()} namespace(s) to scan"
+
+                def hostFindings = [:]
+
+                namespaces.each { namespace ->
+                    echo "  📦 Scanning namespace: ${namespace}"
+
+                    // Scan ConfigMaps
+                    def configMapFindings = scanConfigMapsForPasswords(USER, host, namespace, passwordsToFind)
+
+                    // Scan Secrets
+                    def secretFindings = scanSecretsForPasswords(USER, host, namespace, passwordsToFind)
+
+                    def allNamespaceFindings = configMapFindings + secretFindings
+
+                    if (allNamespaceFindings) {
+                        hostFindings[namespace] = allNamespaceFindings
+                        echo "    ✓ Found ${allNamespaceFindings.size()} matching password(s)"
+                    }
+                }
+
+                // Store findings for this host
+                allFindings[host] = hostFindings
+
+                // Print findings for this host
+                printFindings(host, hostFindings)
+
+            } catch (Exception e) {
+                echo "❌ Error scanning host ${host}: ${e.message}"
+                currentBuild.result = 'UNSTABLE'
+            }
+        }
+    }
+
+    // Final summary stage
+    stage("Summary") {
+        echo """
+
+╔════════════════════════════════════════════════════════════════╗
+║                    📊 SCAN SUMMARY                            ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+
+        def grandTotal = 0
+        allFindings.each { host, findingsByNamespace ->
+            def hostTotal = findingsByNamespace.values().flatten().size()
+            grandTotal += hostTotal
+            echo "  ${host}: ${hostTotal} finding(s)"
+        }
+
+        echo """
+╔════════════════════════════════════════════════════════════════╗
+║  Total findings across all hosts: ${String.valueOf(grandTotal).padRight(28)} ║
+╚════════════════════════════════════════════════════════════════╝
+"""
+
+        if (grandTotal > 0) {
+            echo "⚠️  Action required: Review and rotate the identified passwords"
+        } else {
+            echo "✓ No matching passwords found. Configuration appears secure."
+        }
+    }
+}
