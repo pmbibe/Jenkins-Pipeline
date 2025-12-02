@@ -125,7 +125,7 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                     def lines = value.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                     lines.each { line ->
                                         def parts = line.split('=', 2)
-                                        if (parts.length == 2 && parts[1] == password) {
+                                        if (parts.length == 2 && parts[1].contains(password)) {
                                             findings << [
                                                 type: 'ConfigMap',
                                                 name: configMapName,
@@ -135,7 +135,7 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                             ]
                                         }
                                     }
-                                } else if (value == password) {
+                                } else if (value.contains(password)) {
                                     // Direct value match
                                     findings << [
                                         type: 'ConfigMap',
@@ -209,7 +209,7 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                         def lines = decodedValue.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                         lines.each { line ->
                                             def parts = line.split('=', 2)
-                                            if (parts.length == 2 && parts[1] == password) {
+                                            if (parts.length == 2 && parts[1].contains(password)) {
                                                 findings << [
                                                     type: 'Secret',
                                                     name: secretName,
@@ -219,7 +219,7 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                                 ]
                                             }
                                         }
-                                    } else if (decodedValue == password) {
+                                    } else if (decodedValue.contains(password)) {
                                         // Direct value match
                                         findings << [
                                             type: 'Secret',
