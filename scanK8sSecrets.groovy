@@ -120,8 +120,10 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                             passwordsToFind.each { password ->
                                 if (!password) return
 
+                                def foundInMultiline = false
+
+                                // Handle KEY=VALUE format (multi-line properties)
                                 if (value.contains('=')) {
-                                    // Handle KEY=VALUE format (multi-line properties)
                                     def lines = value.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                     lines.each { line ->
                                         def parts = line.split('=', 2)
@@ -133,10 +135,31 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                                 password: password,
                                                 namespace: namespace
                                             ]
+                                            foundInMultiline = true
                                         }
                                     }
-                                } else if (value.contains(password)) {
-                                    // Direct value match
+                                }
+
+                                // Handle KEY:VALUE format (YAML)
+                                if (value.contains(':')) {
+                                    def lines = value.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
+                                    lines.each { line ->
+                                        def parts = line.split(':', 2)
+                                        if (parts.length == 2 && parts[1].trim().contains(password)) {
+                                            findings << [
+                                                type: 'ConfigMap',
+                                                name: configMapName,
+                                                key: "${key}.${parts[0].trim()}",
+                                                password: password,
+                                                namespace: namespace
+                                            ]
+                                            foundInMultiline = true
+                                        }
+                                    }
+                                }
+
+                                // Fallback: Direct value match if not found in structured format
+                                if (!foundInMultiline && value.contains(password)) {
                                     findings << [
                                         type: 'ConfigMap',
                                         name: configMapName,
@@ -204,8 +227,10 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                 passwordsToFind.each { password ->
                                     if (!password) return
 
+                                    def foundInMultiline = false
+
+                                    // Handle KEY=VALUE format (multi-line properties)
                                     if (decodedValue.contains('=')) {
-                                        // Handle KEY=VALUE format (multi-line properties)
                                         def lines = decodedValue.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                         lines.each { line ->
                                             def parts = line.split('=', 2)
@@ -217,10 +242,31 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                                     password: password,
                                                     namespace: namespace
                                                 ]
+                                                foundInMultiline = true
                                             }
                                         }
-                                    } else if (decodedValue.contains(password)) {
-                                        // Direct value match
+                                    }
+
+                                    // Handle KEY:VALUE format (YAML)
+                                    if (decodedValue.contains(':')) {
+                                        def lines = decodedValue.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
+                                        lines.each { line ->
+                                            def parts = line.split(':', 2)
+                                            if (parts.length == 2 && parts[1].trim().contains(password)) {
+                                                findings << [
+                                                    type: 'Secret',
+                                                    name: secretName,
+                                                    key: "${key}.${parts[0].trim()}",
+                                                    password: password,
+                                                    namespace: namespace
+                                                ]
+                                                foundInMultiline = true
+                                            }
+                                        }
+                                    }
+
+                                    // Fallback: Direct value match if not found in structured format
+                                    if (!foundInMultiline && decodedValue.contains(password)) {
                                         findings << [
                                             type: 'Secret',
                                             name: secretName,
