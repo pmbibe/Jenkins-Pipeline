@@ -6,6 +6,10 @@ def NAMESPACES= ['', '', '']
 
 def findConfigmapInNamespace(String user, String bastion, String namespace, 
                              String searchTerm, String moduleName) {
+    /**
+     * Tìm ConfigMap tương ứng với searchTerm trong namespace
+     * Sử dụng getBestMatch để fuzzy search
+     */
     def configmaps = sh(
         script: """
             ssh ${user}@${bastion} kubectl get configmap -n ${namespace} | awk 'NR > 1 {print \$1}'
@@ -22,12 +26,29 @@ def findConfigmapInNamespace(String user, String bastion, String namespace,
     return bestCandidate
 }
 
+// ====== END NEW FUNCTIONS ======
+
 def parseModuleConfigWithVariables(String yamlString) {
+    /**
+     * Parse cấu trúc mới:
+     * authentication:
+     *   dev:
+     *     variables: {...}
+     *   staging:
+     *     variables: {...}
+     *   all:
+     *     variables: {...}
+     */
     def yaml = new Yaml().load(yamlString)
     return yaml ?: [:]
 }
 
 def expandConfigmapNamespaces(def namespaceValue, List<String> definedNamespaces) {
+    /**
+     * Xử lý namespace value có thể là:
+     * - String "dev" hoặc "All"
+     * - List ["dev", "staging"]
+     */
     def result = []
     
     if (namespaceValue instanceof String) {
@@ -53,6 +74,7 @@ def expandConfigmapNamespaces(def namespaceValue, List<String> definedNamespaces
     return result
 }
 
+// ============ THAY THẾ HÀM NÀY ============
 def processModuleConfigurations(Map moduleConfigs, List<String> definedNamespaces, 
                                 List<String> bastions) {
     def taskList = []
@@ -134,6 +156,7 @@ def processModuleConfigurations(Map moduleConfigs, List<String> definedNamespace
     return taskList
 }
 
+// ============ THAY THẾ HÀM NÀY ============
 def printAllChangesPreview(List<Map> taskList) {
     echo """
 
@@ -181,7 +204,11 @@ def printAllChangesPreview(List<Map> taskList) {
 }
 
 def deepMergeMap(Map base, Map override) {
-
+    /**
+     * Merge 2 maps - override values sẽ ghi đè base values
+     * Nếu value là map → recursive merge
+     * Nếu value khác → override lấy giá trị mới
+     */
     def result = base.clone()
     
     override.each { key, value ->
@@ -197,7 +224,9 @@ def deepMergeMap(Map base, Map override) {
 
 
 def printChangePreview(Map task) {
-
+    /**
+     * In preview thay đổi chi tiết cho 1 task
+     */
     def yamlDump = new Yaml().dumpAs(task.variables, null, DumperOptions.FlowStyle.BLOCK)
     def indentedYaml = yamlDump.split('\n').collect { line -> "  ${line}" }.join('\n')
     
@@ -219,7 +248,10 @@ ${indentedYaml.split('\n').collect { "│ " + String.format('%-60s', it) + "│"
 }
 
 def convertVariablesToUpdateFormat(Map variables) {
-
+    /**
+     * Chuyển đổi variables YAML thành format mà setValueForKeyPath có thể dùng
+     * Trả về: YAML string để load vào updateConfigmap
+     */
     def yaml = new Yaml()
     return yaml.dumpAs(variables, null, DumperOptions.FlowStyle.BLOCK)
 }
@@ -388,13 +420,13 @@ def backupAndDeploy(USER, BASTION){
     stage("Gen Backup Configmap"){
         
         sh """
-                scp  ${backupFile} ${USER}@${BASTION}:/tmp/
+                rsync -av --mkpath  ${backupFile} ${USER}@${BASTION}:/tmp/backup_${BUILD_NUMBER}/
             """ 
     }
     stage("Gen Deploy Configmap"){
         
         sh """
-                scp  ${deployFile} ${USER}@${BASTION}:/tmp/
+                rsync -av --mkpath  ${deployFile} ${USER}@${BASTION}:/tmp/deploy_${BUILD_NUMBER}/
             """ 
     } 
     stage("Clean"){
