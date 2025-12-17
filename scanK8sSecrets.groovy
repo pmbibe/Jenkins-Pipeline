@@ -74,7 +74,7 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                     def lines = value.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                     lines.each { line ->
                                         def parts = line.split('=', 2)
-                                        if (parts.length == 2 && parts[1].contains(password)) {
+                                        if (parts.length == 2 && parts[1].toLowerCase().contains(password.toLowerCase())) {
                                             findings << [
                                                 type: 'ConfigMap',
                                                 name: configMapName,
@@ -92,7 +92,7 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                     def lines = value.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                     lines.each { line ->
                                         def parts = line.split(':', 2)
-                                        if (parts.length == 2 && parts[1].trim().contains(password)) {
+                                        if (parts.length == 2 && parts[1].trim().toLowerCase().contains(password.toLowerCase())) {
                                             findings << [
                                                 type: 'ConfigMap',
                                                 name: configMapName,
@@ -106,7 +106,7 @@ def scanConfigMapsForPasswords(String user, String host, String namespace, List 
                                 }
 
                                 // Fallback: Direct value match if not found in structured format
-                                if (!foundInMultiline && value.contains(password)) {
+                                if (!foundInMultiline && value.toLowerCase().contains(password.toLowerCase())) {
                                     findings << [
                                         type: 'ConfigMap',
                                         name: configMapName,
@@ -181,7 +181,7 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                         def lines = decodedValue.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                         lines.each { line ->
                                             def parts = line.split('=', 2)
-                                            if (parts.length == 2 && parts[1].contains(password)) {
+                                            if (parts.length == 2 && parts[1].toLowerCase().contains(password.toLowerCase())) {
                                                 findings << [
                                                     type: 'Secret',
                                                     name: secretName,
@@ -199,7 +199,7 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                         def lines = decodedValue.split('\n').collect { it.trim() }.findAll { it && !it.startsWith('#') }
                                         lines.each { line ->
                                             def parts = line.split(':', 2)
-                                            if (parts.length == 2 && parts[1].trim().contains(password)) {
+                                            if (parts.length == 2 && parts[1].trim().toLowerCase().contains(password.toLowerCase())) {
                                                 findings << [
                                                     type: 'Secret',
                                                     name: secretName,
@@ -213,7 +213,7 @@ def scanSecretsForPasswords(String user, String host, String namespace, List pas
                                     }
 
                                     // Fallback: Direct value match if not found in structured format
-                                    if (!foundInMultiline && decodedValue.contains(password)) {
+                                    if (!foundInMultiline && decodedValue.toLowerCase().contains(password.toLowerCase())) {
                                         findings << [
                                             type: 'Secret',
                                             name: secretName,
