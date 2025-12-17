@@ -1,5 +1,3 @@
-0239231E-BA30-473B-8C04-2172D0664A81
-
 import org.yaml.snakeyaml.Yaml
 
 // ==================== CONFIGURATION ====================
