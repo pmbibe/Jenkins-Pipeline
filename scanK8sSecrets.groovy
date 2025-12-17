@@ -1,55 +1,4 @@
-/*
- * ==============================================================================
- * Kubernetes ConfigMap & Secret Password Scanner
- * ==============================================================================
- *
- * PURPOSE:
- *   Scans Kubernetes ConfigMaps and Secrets across multiple hosts and namespaces
- *   to identify which configuration variables contain values matching a target
- *   password list.
- *
- * USAGE:
- *   1. Configure the passwordsToFind list in passwordsToFind.groovy
- *   2. Set the USER variable (SSH username)
- *   3. Set the HOSTS list (BASTION/SERVER hosts to scan)
- *   4. Run the Jenkins pipeline
- *
- * CONFIGURATION:
- *   - USER: SSH username for connecting to hosts
- *   - HOSTS: List of BASTION/SERVER hosts (treated as unified list)
- *   - passwordsToFind: Loaded from passwordsToFind.groovy
- *
- * BEHAVIOR:
- *   - Scans ALL namespaces EXCEPT those starting with "openshift*"
- *   - Checks both ConfigMaps and Secrets
- *   - Compares all values against the passwordsToFind list
- *   - Hosts are scanned IN PARALLEL for optimal performance
- *   - Each host generates a separate artifact file
- *
- * OUTPUT:
- *   - Per-host artifact files: password-findings-{host}-{BUILD_NUMBER}.txt
- *   - Consolidated report: password-findings-ALL-HOSTS-{BUILD_NUMBER}.txt
- *   - Format: {ResourceType}: {name} ----- {key} = {password}
- *   - All files saved as Jenkins artifacts for download
- *   - Console shows summary only (no detailed findings)
- *
- * EXAMPLE CONFIGURATION:
- *   USER = 'jenkins'
- *   HOSTS = ['bastion1.example.com', 'bastion2.example.com']
- *
- *   In passwordsToFind.groovy:
- *   def passwordsToFind = [
- *       'weakPassword123',
- *       'defaultPass456'
- *   ]
- *
- * PERFORMANCE:
- *   - Multiple hosts are scanned in parallel (significant time savings)
- *   - Example: 3 hosts taking 10min each = ~10min total (vs 30min sequential)
- *   - Each host runs independently without blocking others
- *
- * ==============================================================================
- */
+0239231E-BA30-473B-8C04-2172D0664A81
 
 import org.yaml.snakeyaml.Yaml
 
@@ -58,7 +7,7 @@ def USER = ''  // SSH user for connecting to hosts
 def HOSTS = []  // Unified list of BASTION/SERVER hosts (e.g., ['host1.example.com', 'host2.example.com'])
 
 // Load passwords to find - will be loaded from passwordsToFind.groovy at runtime
-def passwordsToFind = null
+def passwordsToFind = ['ducptm']
 
 // ==================== HELPER FUNCTIONS ====================
 
@@ -66,7 +15,7 @@ def getAllNamespaces(String user, String host) {
     """Get all namespaces except those starting with 'openshift'"""
     def output = sh(
         script: """
-            ssh ${user}@${host} 'kubectl get namespaces -o name | cut -d"/" -f2 | grep -v "^openshift"'
+            ssh ${user}@${host} 'kubectl get namespaces -o name | cut -d"/" -f2 | grep -vE "^(openshift|default|assisted|dcit|health|keycloak|kube|kong|ocp|open|twistlock|micro)"'
         """,
         returnStdout: true
     ).trim()
@@ -355,7 +304,7 @@ node("built-in") {
     stage("Load Configuration") {
         echo "📥 Loading password list from passwordsToFind.groovy..."
 
-        def passwordsScript = load "${WORKSPACE}/passwordsToFind.groovy"
+        def passwordsScript = ['ducptm']
         passwordsToFind = passwordsScript
 
         echo "✓ Loaded ${passwordsToFind?.size() ?: 0} password(s) to search for"
